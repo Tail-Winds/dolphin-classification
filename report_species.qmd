@@ -1,0 +1,1046 @@
+---
+title: "Dolphin species classification"
+subtitle: "Technical report"
+author: "Vyacheslav Lyubchich et al."
+date: today
+date-format: iso
+
+header-includes:
+  \usepackage{float}
+  \floatplacement{figure}{h}
+  \usepackage[section]{placeins} 
+  \usepackage{tocloft} 
+  \renewcommand{\cftsecleader}{\cftdotfill{\cftdotsep}}
+  \newcommand{\beginsupplement}{
+    \setcounter{table}{0}
+    \renewcommand{\thetable}{S\arabic{table}}
+    \setcounter{figure}{0}
+    \renewcommand{\thefigure}{S\arabic{figure}}
+    \setcounter{section}{0}
+    \renewcommand{\thesection}{S\arabic{section}}
+  }
+
+bibliography:
+    - refpackages.bib
+    - refpackages_manual.bib
+csl: springer-basicVL.csl
+
+format:
+  pdf:
+    toc: true
+    lof: false
+    lot: false
+    geometry:
+      - top = 1in
+      - left = 1in
+      - right = 1in
+      - bottom = 1in
+    fig-width: 8
+    fig-height: 4
+    number-sections: true
+    code-link: false
+    colorlinks: true
+knitr:
+  opts_chunk:
+    echo: false
+    collapse: false
+    message: false
+    warning: false
+    comment: "#>"
+    R.options:
+      knitr.graphics.auto_pdf: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r}
+#| echo: false
+
+rm(list = ls())
+options(width = 120)
+
+library(knitr)
+
+# To change the text size of R outputs
+# Huge > huge > LARGE > Large > large > normalsize > small > footnotesize > scriptsize > tiny
+opts_chunk$set(size = "footnotesize")
+def.chunk.hook <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", 
+         paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), 
+         x)
+})
+```
+
+
+# Packages
+
+Load R packages used in this report, including
+dplyr [@R-dplyr],
+tidyr [@R-tidyr], ggplot2 [@R-ggplot2], patchwork [@R-patchwork], banter [@R-banter], pdp [@R-pdp], and rfPermute [@R-rfPermute].
+
+```{r}
+# Data manipulation
+library(dplyr)
+library(tidyr)
+
+# Plotting
+library(ggplot2)
+library(patchwork)
+
+# Modeling
+library(banter)
+source("code/misc.R")
+library(pdp)
+library(rfPermute)
+```
+
+
+# General parameters
+
+```{r}
+# Significance level
+alpha = 0.05
+
+# Plot theme
+theme_set(theme_light())
+
+# Rerun model cross-validation to update results?
+rerun_CV <- FALSE
+
+# Number of folds
+K <- 5
+Ktimes <- 5
+
+# Rerun PDPs in the appendix?
+rerun_pdp <- FALSE
+```
+
+Significance level $\alpha$ = `r alpha*100`%.
+
+
+# Data summaries
+
+PAMGuard and ROCCA whistle summaries were additionally processed using `code/dataprocess.R` comprising the following steps.
+
+1. For the T1C data, use the column `UTC` to update ROCCA-generated event IDs:
+
+    - Sort the data chronologically and identify uninterrupted sequences of event IDs from the ROCCA output;
+    - Number the uninterrupted sequences of event IDs;
+    - Update the event IDs by appending the ROCCA-generated event ID and the assigned number;
+    - Split the new events such that the time gap between consecutive whistles is no more than 5 minutes, update the event IDs again.
+    
+1. For the NOAA data, correct the dates, using the original column `Source`.
+1. For the Watkins data, correct the dates, using the original column `Source` and metadata.
+1. For the Brazil data, use the column `UTC` to split the data in 5-minute events and update the ROCCA-generated single event ID.
+1. From each dataset, select the columns `species`, ID columns (`Source`, `event.id`, `call.id`, `Year`, `Month`, and `UTC`), and potential predictors.
+1. Combine the datasets.
+1. Remove columns in which all values are the same.
+
+
+```{r}
+# Response variable
+RESPONSE <- "species"
+
+# Columns with ID information that should not be used for training models
+idcols_wsl <- c("Source", "event.id", "call.id", "Year", "Month", "UTC")
+vars4table <- c("freqMaxMinRatio", "freqRelBW", "freqStdDev", 
+                "freqMean", "freqRange", "freqSlopeRatio",
+                "freqCenter", "freqCOFM", "duration", "freqSlopeMean",
+                "freqBeg") # The last one 11th is just to compare with earlier table summary, do not show in the paper
+
+# Outputs of dataprocess.R
+D_wsl <- readRDS("dataderived/dataprocess_D_wsl.rds") %>% 
+    # Rename the source as in the paper
+    mutate(Source = case_match(Source, 
+                           "T1C" ~ "T1C",
+                           "NOAA" ~ "AMAPPS", 
+                           "Watkins" ~ "Watkins", 
+                           "Brazil" ~ "UFRJ"))
+predictors_wsl <- readRDS("dataderived/dataprocess_predictors_wsl.rds")
+```
+
+
+```{r}
+tmpspec <- table(D_wsl$species)
+```
+
+Eventually, assign the response variable: `r RESPONSE`.
+
+Predictors for whistle classification (`r length(predictors_wsl)` predictors) in alphabetic order: `r paste0(predictors_wsl, collapse = ", ")`.
+
+Total number of whistles is `r sum(tmpspec)`, including `r tmpspec[1]` whistles of bottlenose dolphins and `r tmpspec[2]` whistles of common dolphins (see details in @tbl-tabcount).
+
+```{r}
+#| label: tbl-tabcount
+#| tbl-cap: "Number of whistles available from each source and year along with the event counts."
+
+tmp <- with(D_wsl,
+            tapply(event.id, Source, function(x) length(unique(x))))
+tabcount <- with(D_wsl,
+                 table(Source, Year) %>% 
+                   cbind(`Whistle, count` = table(Source)) %>%   
+                   cbind(`Whistle, %` = round(100*prop.table(table(Source)), 3)) %>% 
+                   cbind(`Event, count` = tmp) %>% 
+                   cbind(`Event, %` = round(100*prop.table(tmp), 3))
+)
+tabcount <- tabcount %>% 
+  rbind(Total = colSums(tabcount))
+tabcount <- cbind(`Dolphin species` = c("Common", "Bottlenose", "Common", "Common", "--"),
+                  tabcount) %>% 
+  as_tibble(rownames = "Source")
+
+tabcount %>% 
+  knitr::kable(digits = 2, 
+               align = "r",
+               longtable = TRUE)
+```
+
+From @tbl-tabevent and @fig-tabevent, bottlenose dolphin encounters and common dolphin encounters recorded in the Watkins dataset contain much fewer whistles than common dolphin encounters from the UFRJ and AMAPPS datasets.
+
+```{r}
+#| label: tbl-tabevent
+#| tbl-cap: "Statistical summaries of the number of whistles per event."
+
+tabevent0 <- D_wsl %>% 
+  group_by(event.id) %>% 
+  summarise(Source = Mode(Source),
+            species = Mode(species),
+            Event_wsl_count = n()) 
+
+tmp <- psych::describeBy(tabevent0 %>% select(Event_wsl_count) %>% as.vector(),
+                         tabevent0$Source,
+                         fast = TRUE)
+
+tabevent <- do.call(rbind, tmp) %>% 
+  select(-vars, -range)
+
+tabevent <- cbind(`Dolphin species` = c("Common", "Common", "Bottlenose", "Common"),
+                  tabevent) %>% 
+  as_tibble(rownames = "Source")
+
+tabevent %>% 
+  knitr::kable(digits = 2, 
+               align = "r",
+               longtable = TRUE)
+```
+
+
+```{r}
+#| label: fig-tabevent
+#| fig-cap: "Distributions of events by the number of whistles in each. The bin width is 20."
+
+tabevent0 %>% 
+  ggplot(aes(x = Event_wsl_count)) + 
+  geom_histogram(aes(y = after_stat(count)), binwidth = 20, fill = "grey50") + 
+  facet_wrap(~Source, scales = "free_y") + 
+  ylab("Count of events") +
+  xlab("Number of whistles in an event")
+```
+
+
+# Results
+
+## Compare models
+
+```{r}
+# Create event table as for BANTER
+ev <- D_wsl %>%
+  group_by(event.id) %>%
+  summarise(species = unique(species)[1]) %>%
+  # left_join(tabevent0 %>% select(event.id, WhistlePerMinute), by = "event.id") %>% 
+  as.data.frame()
+
+set.seed(123)
+
+# Create folds
+FOLDS <- caret::createFolds(ev$species, k = K)
+```
+
+
+```{r}
+if (rerun_CV) {
+  source("code/mod_cv_banter.R")
+  source("code/mod_cv_rf.R")
+  source("code/mod_cv_rfnoBoruta.R")
+  source("code/mod_cv_nn.R")
+}
+
+# Load cross-validation results
+cv_banter <- readRDS("dataderived/mod_cv_banter_out.rds")
+cv_rf <- readRDS("dataderived/mod_cv_rf_out.rds")
+cv_rfnoBoruta <- readRDS("dataderived/mod_cv_rfnoBoruta_out.rds")
+cv_nn <- readRDS("dataderived/mod_cv_nn_out.rds")
+```
+
+
+```{r}
+# Combine CV results
+CVcomb <- bind_rows(cv_banter$RES_test %>% mutate(Method = "Banter", nvars = length(predictors_wsl)),
+                    cv_rf$RES_test %>% mutate(Method = "RF + Boruta", nvars = length(predictors_wsl)),
+                    cv_rfnoBoruta$RES_test %>% mutate(Method = "RF"),
+                    cv_nn$RES_test %>% mutate(Method = "NN")
+                    )
+CVcomb_long <- CVcomb %>% 
+  pivot_longer(cols = c(-Fold, -Method), names_to = "Metric", values_to = "Value") %>% 
+    mutate(Method = factor(Method, levels = c("Banter", "RF", "RF + Boruta", "NN")))
+
+# Select metrics that will be plotted
+varsCV2plot <- c("Sensitivity"
+                 ,"Specificity"
+                 ,"Balanced Accuracy"
+                 # ,"F1"
+                 )
+```
+
+See @fig-CVcomb and @tbl-cv with results of `r K`-fold cross-validation applied `r Ktimes` times (each boxplot corresponds to `r K*Ktimes` values).
+The folds were created considering the underlying species proportions, hence each testing set (validation fold) contained about `r round(sum(ev$species == "Bottlenose") / K, 0)` events with bottlenose dolphins and about `r round(sum(ev$species == "Common") / K, 0)` events with common dolphins.
+
+```{r}
+#| label: fig-CVcomb
+#| fig-cap: "Boxplots of classification performance metrics from cross-validation."
+
+CVcomb_long %>%
+  filter(Metric %in% varsCV2plot) %>% 
+  ggplot(aes(x = Method, y = Value)) +
+  geom_boxplot() +
+  stat_summary(fun = mean, geom = "point", shape = 4, size = 2, col = "gray50") +
+  facet_wrap(~Metric
+             ,ncol = length(varsCV2plot)
+             # , scales = "free_y"
+             ) + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+```
+
+```{r}
+#| label: tbl-cv
+#| tbl-cap: "Average performance of different methods in cross-validation."
+
+CVcomb %>% 
+  select(all_of(c("Method", varsCV2plot))) %>% 
+  group_by(Method) %>% 
+  summarise_all(mean) %>% 
+  knitr::kable(digits = 2)
+```
+
+
+
+```{r}
+# Combine individual predictions from multiple methods and join with event stats
+PREDS <- bind_rows(cv_banter$PREDS %>% mutate(Method = "BANTER"),
+                   cv_rf$PREDS %>% mutate(Method = "RF"),
+                   cv_rfnoBoruta$PREDS %>% mutate(Method = "RFnoBoruta"),
+                   cv_nn$PREDS %>% mutate(Method = "NN")
+                   ) %>% 
+  mutate(Method = factor(Method, 
+                         levels = c("BANTER", "RFnoBoruta", "RF", "NN"),
+                         labels = c("Banter", "RF", "RF + Boruta", "NN"))) %>% 
+  left_join(tabevent0, by = "event.id")
+
+nbins <- c(10, 50, 100, 250, 500, 1000, 10000)
+# Calculate accuracies 
+PREDSacc <- PREDS %>% 
+  mutate(acc = species == Predicted) %>% 
+  group_by(Method, species, Event_wsl_count) %>% 
+  summarise(Accuracy = mean(acc),
+            Nobs = n()) %>% 
+  mutate(n = cut(Nobs, c(0, nbins), labels = nbins))
+```
+
+@fig-CVacc shows high variability of accuracy of classification based on the number of whistles in an event.
+@fig-CVacc2 focuses on the events with fewer whistles and shows that the accuracy is generally increasing with the number of whistles in an event, and accuracy of classifying events with just one whistle is not very different from accuracy obtained for events with more whistles.
+
+```{r}
+#| label: fig-CVacc
+#| fig-cap: "Cross-validation accuracy of classifying events for each species, based on the applied method and whistle count per event."
+
+PREDSacc %>%
+  ggplot(aes(x = Event_wsl_count, y = Accuracy)) +
+  geom_line(aes(color = Method)) +
+  geom_point(aes(color = Method)) +
+  facet_wrap(~ species
+             ,ncol = 2
+             , scales = "free_x"
+             ) + 
+  scale_x_continuous(breaks = seq(0, max(PREDSacc$Event_wsl_count), by = 100)) +
+  xlab("Number of whistles in an event")
+```
+
+```{r}
+#| label: fig-CVacc2
+#| fig-cap: "Cross-validation accuracy of classifying events for each species (for events with up to 20 whistles), based on the applied method and whistle count per event. The point sizes correspond to the number of times the events of given length appeared in cross-validation."
+#| fig-height: 8
+
+PREDSacc %>%
+  filter(Event_wsl_count <= 20) %>% 
+  ggplot(aes(x = Event_wsl_count, y = Accuracy)) +
+  geom_line() +
+  geom_point(aes(size = n)) +
+  facet_wrap(~ Method + species
+             ,ncol = 2
+             # , scales = "free_x"
+             ) + 
+  scale_x_continuous(breaks = seq(0, max(PREDSacc$Event_wsl_count), by = 5)) +
+  xlab("Number of whistles in an event")
+```
+
+The best-performing model is the BANTER model (stacked random forests) retrained to classify between two species of dolphins.
+
+\FloatBarrier
+## Analysis of the selected model 
+
+Refit the model on the whole dataset.
+
+```{r}
+#| cache: true
+
+require(banter)
+set.seed(123)
+
+# Combine data in BANTER format
+D <- list(events = ev,
+          detectors = list(dw = D_wsl %>% 
+                               select(-species) %>%
+                               select(-any_of(idcols_wsl %>% setdiff(c("call.id", "event.id")))) %>%
+                               as.data.frame()))
+
+# Initialize BANTER model
+bant.mdl <- initBanterModel(D$events)
+
+# Add BANTER Detectors and Run Detector Models
+bant.mdl <- addBanterDetector(
+    bant.mdl,
+    data = D$detectors,
+    ntree = 1000,
+    importance = TRUE,
+    sampsize = 0.5
+)
+
+# Second-stage BANTER event model based on output from the Detector Models
+bant.mdl2 <- runBanterModel(bant.mdl, ntree = 1000, sampsize = 1)
+saveRDS(list(D = D, bant.mdl = bant.mdl, bant.mdl2 = bant.mdl2),
+        file = paste0("dataderived/banter_modelobjects_", Sys.Date(), ".rds"))
+```
+
+```{r}
+# Extract RF models for each level
+rf1 <- getBanterModel(bant.mdl2, "dw")
+rf2 <- getBanterModel(bant.mdl2)
+df1 <- D$detectors$dw
+df2 <- getBanterModelData(bant.mdl2)
+```
+
+
+\FloatBarrier
+### Level 1: Whistles 
+
+Summary of the detector-level model from the package BANTER
+```{r}
+summary(bant.mdl)
+```
+
+Another summary
+```{r}
+print(rf1)
+```
+
+
+```{r}
+#| label: fig-detector
+#| fig-cap: "Detector-level model performance on out-of-bag (OOB) data."
+
+# This function from the package BANTER plots wrong y-title, 
+# so use its inside code with the package rfPermute to plot correctly
+# plotDetectorTrace(bant.mdl, ylab = "A")
+
+rfPermute::plotTrace(rf1) + 
+  ylab("Accuracy (%)")
+
+# summary(rf1) # gives the summary and the plot together
+```
+
+
+```{r}
+#| label: fig-importance1
+#| fig-cap: "Variables in the detector-level model ranked by their importance (mean decrease in classification accuracy), with the most important on top."
+#| fig-height: 8
+
+rfPermute::plotImportance(rf1, plot.type = "heatmap", 
+               imp.type = c("MeanDecreaseAccuracy", "MeanDecreaseGini"),
+               ranks = TRUE)
+```
+
+
+\FloatBarrier
+### Level 2: Events
+
+Summary of the detector-level model from the package BANTER
+```{r}
+summary(bant.mdl2)
+```
+
+Another summary
+```{r}
+print(rf2)
+```
+
+Overall performance is adequate, with high overall accuracy.
+
+```{r}
+#| label: fig-eventes
+#| fig-cap: "Event-level model performance on out-of-bag (OOB) data."
+
+rfPermute::plotTrace(rf2) + 
+  ylab("Accuracy (%)") + 
+  ylim(80, 100)
+```
+
+@tbl-acc shows BANTER summary with the percent of each species correctly classified for each detector model and the event model. 
+It is a summary of the diagonal values from the confusion matrices for all models.
+```{r}
+#| label: tbl-acc
+#| tbl-cap: "Percent of correct classifications by different levels of the model."
+
+# plotConfMat(rf2, title = "Confusion Matrix HeatMap")
+modelPctCorrect(bant.mdl2) %>% 
+  knitr::kable(digits = 3)
+```
+
+
+```{r}
+#| label: fig-votes
+#| fig-cap: "Number of trees that predicted each species (i.e., votes from each tree)."
+
+plotVotes(rf2)
+```
+
+
+```{r}
+#| label: tbl-votes
+#| tbl-cap: "Percent of correct classifications given different thresholds for the proportion of trees that need to vote for that species."
+
+pctCorrect(rf2, pct = c(seq(0.1, 0.9, 0.1), 0.95)) %>% 
+    dplyr::select(-class) %>% 
+    t() %>% 
+    `colnames<-`(c("Bottlenose", "Common", "Overall")) %>% 
+    knitr::kable(digits = 1)
+```
+
+From <https://taikisan21.github.io/PAMpal/banterGuide.html#UNDER_DEVELOPMENT>:
+"These values will always decrease as the percent of trees threshold increases. That is because as stringency is decreased (lower thresholds), more samples are likely to be correctly classified. These values give an indication of the fraction of events that can be classified with high certainty."
+
+In our analysis, there are many cases which were classified with high certainty (see @tbl-votes).
+The certainty is higher for bottlenose dolphins (@tbl-votes).
+However, some of the events that were classified as common dolphins with high certainty (> 90%) were bottlenose dolphin occurrences (right plot in @fig-probs).
+
+```{r}
+#| label: fig-probs
+#| fig-cap: "Distribution of votes (assignment probabilities) for each of the predicted species. The true species are coded by colors."
+
+plotPredictedProbs(rf2, bins = 30, plot = TRUE)
+```
+
+
+```{r}
+#| label: fig-probs2
+#| fig-cap: "Distribution of votes (assignment probabilities) for each of the predicted species. The true species are coded by colors."
+
+# Modify the function to add a vertical axis break at location y
+plotPredictedProbs2 <- function(
+        x,              # randomForest object
+        bins = 30,      # Number of histogram bins
+        plot = TRUE,    # Whether to print the plot
+        y_break = NULL  # Y-axis break location (optional)
+) {
+    # Load required package for axis breaks
+    library(ggbreak)
+    
+    # Validate input
+    rf <- as.randomForest(x)
+    if (rf$type == "regression") {
+        stop("'rf' must be of a classification model")
+    }
+    
+    # Create the plot
+    p <- rf$votes %>%
+        as.data.frame() %>%
+        cbind(class = as.character(rf$y), predicted = as.character(rf$predicted)) %>%
+        tidyr::gather("pred.class", "prob", -class, -predicted) %>%
+        dplyr::filter(predicted == pred.class) %>%
+        dplyr::mutate(correct = class == predicted) %>%
+        ggplot2::ggplot(ggplot2::aes(prob, fill = class)) +
+        ggplot2::geom_histogram(bins = bins) +
+        ggplot2::facet_wrap(~predicted) +
+        ggplot2::labs(x = "Assignment probability", y = "Frequency")
+    
+    # Add y-axis break if specified
+    if (!is.null(y_break)) {
+        p <- p + ggbreak::scale_y_break(breaks = y_break, scales = "fixed")
+    }
+    
+    p <- p + ggplot2::theme_bw() +
+        ggplot2::theme(legend.title = ggplot2::element_blank(), 
+                       strip.background = ggplot2::element_blank(),
+                       panel.background = ggplot2::element_blank(),
+                       panel.border = ggplot2::element_blank()) + 
+        ylim(0, 991) + 
+        ggplot2::scale_y_continuous(breaks = seq(0, 991, by = 10),
+                                    sec.axis = ggplot2::dup_axis(labels = NULL, breaks = NULL)) 
+    # Print plot if requested
+    if (plot) {
+        print(p)
+    }
+    
+    # Return plot object invisibly
+    invisible(p)
+}
+
+theme_set(theme_grey()) #https://github.com/YuLab-SMU/ggbreak/issues/57
+plotPredictedProbs2(rf2, bins = 30, plot = TRUE, y_break = c(50, 970))
+theme_set(theme_light()) 
+```
+
+
+
+```{r}
+#| label: fig-importance2
+#| fig-cap: "Variables in the event-level model ranked by their importance (mean decrease in classification accuracy), with the most important on top."
+
+rfPermute::plotImportance(rf2, plot.type = "bar", 
+                          imp.type = c("MeanDecreaseAccuracy"),
+                          ranks = FALSE)
+```
+
+
+\FloatBarrier
+### Misclassified events
+
+```{r}
+misclass <- casePredictions(rf2) %>% 
+  filter(!is.correct) %>% 
+  as_tibble() # %>% select(id)
+readr::write_csv(misclass, paste0("dataderived/banter_misclass_", Sys.Date(), ".csv"))
+```
+
+There are `r nrow(misclass)` misclassified events (@tbl-misclass).
+
+```{r}
+#| label: tbl-misclass
+#| tbl-cap: "List of misclassified events with the model vote proportions for each species."
+
+knitr::kable(misclass %>% 
+                 dplyr::select(-is.correct), 
+             digits = 2)
+```
+
+
+\FloatBarrier
+## Use the selected model 
+
+### Chesapeake Bay bottlenose
+
+```{r}
+# Load unlabeled data
+D_wsl_CB <- readRDS("dataderived/dataprocess_CB_2019Summer_wsl.rds")
+
+# Create event table as for Banter
+ev_CB <- D_wsl_CB %>%
+    group_by(event.id) %>%
+    summarise(n = n(),
+              UTC = UTC[1],
+              Year = Year[1],
+              Month = Month[1],
+              Source = Source[1]) %>% 
+    as.data.frame()
+
+DCB <- list(events = ev_CB,
+           detectors = list(dw = D_wsl_CB  %>%
+                                # select(-any_of(idcols_wsl %>% setdiff(c("call.id", "event.id")))) %>%
+                                select(all_of(c(predictors_wsl, "call.id", "event.id"))) %>% 
+                                as.data.frame()))
+    
+# Use the model to classify the data
+XPred <- predict(bant.mdl2, DCB)
+
+# Combine events data with predictions
+EVCB <- left_join(XPred$events, 
+                 XPred$predict.df %>% dplyr::select(event.id, predicted),
+                 by = join_by(event.id))
+```
+
+The `r nrow(ev_CB)` unlabeled events were mostly classified as bottlenose dolphins (@tbl-predpropCB).
+
+```{r}
+#| label: tbl-predpropCB
+#| tbl-cap: "Summary of the predicted species."
+
+tmp1 <- table(XPred$predict.df$predicted)
+tmp2 <- tmp1 * 100 / nrow(ev_CB)
+
+cbind(`Number of events` = tmp1,
+      Percent = tmp2) %>% 
+    knitr::kable(digits = 2)
+```
+
+Show which events (if any) were classified as common dolphins
+
+```{r}
+EVCB %>% 
+  dplyr::filter(predicted == "Common")
+```
+
+Check number of whistles per event (@fig-nCB):
+```{r}
+table(ev_CB$n)
+```
+
+```{r}
+#| label: fig-nCB
+#| fig-cap: "number of whistles per event in the Chesapeake Bay dataset."
+
+ggplot(ev_CB, aes(x = n)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = "Number of whistles per event",
+       y = "Frequency")
+```
+
+
+\FloatBarrier
+### Unlabeled data
+
+```{r}
+# Load unlabeled data
+D_wsl_2 <- readRDS("dataderived/dataprocess_A5C_wsl.rds")
+
+# From Caroline on Slack:
+# A-5C coordinates are 38.35, -74.72 and metocean buoy are 38.35, -74.75
+
+# Create event table as for Banter
+ev_2 <- D_wsl_2 %>%
+    group_by(event.id) %>%
+    summarise(n = n(),
+              UTC = UTC[1],
+              Year = Year[1],
+              Month = Month[1],
+              Source = Source[1]) %>% 
+    as.data.frame()
+
+D2 <- list(events = ev_2,
+           detectors = list(dw = D_wsl_2  %>%
+                                # select(-any_of(idcols_wsl %>% setdiff(c("call.id", "event.id")))) %>%
+                                select(all_of(c(predictors_wsl, "call.id", "event.id"))) %>% 
+                                as.data.frame()))
+    
+# Use the model to classify the data
+XPred <- predict(bant.mdl2, D2)
+
+# Combine events data with predictions
+EV2 <- left_join(XPred$events, 
+                 XPred$predict.df %>% dplyr::select(event.id, predicted),
+                 by = join_by(event.id))
+```
+
+The `r nrow(ev_2)` unlabeled events were mostly classified as bottlenose dolphins (@tbl-predprop).
+
+```{r}
+#| label: tbl-predprop
+#| tbl-cap: "Summary of the predicted species."
+
+tmp1 <- table(XPred$predict.df$predicted)
+tmp2 <- tmp1 * 100 / nrow(ev_2)
+
+cbind(`Number of events` = tmp1,
+      Percent = tmp2) %>% 
+    knitr::kable(digits = 2)
+```
+
+```{r}
+#| label: fig-predprop
+#| fig-cap: "Assignment probabilities for each of the species (since this is a binary classification, the plots are mirrow images of each other)."
+
+p1 <- XPred$predict.df %>% 
+    ggplot(aes(x = Bottlenose)) + 
+    geom_histogram(binwidth = 0.05, center = 0.05/2) + 
+    ylab("Number of classifications") + 
+    xlab("Proportion of trees voted for bottlenose")
+
+p2 <- XPred$predict.df %>%
+    ggplot(aes(x = Common)) +
+    geom_histogram(binwidth = 0.05, center = 0.05/2) +
+    ylab("Number of classifications") +
+    xlab("Proportion of trees voted for common")
+
+p1 + p2 +
+    plot_annotation(tag_levels = "A")
+```
+
+```{r}
+with(EV2,
+    table(Source, predicted)
+)
+```
+
+```{r}
+#| label: fig-predts
+#| fig-cap: "Number of events and their predicted species by month."
+
+ev2 <- EV2 %>%
+    group_by(Year, Month, predicted) %>% 
+    summarise(n = n()) %>% 
+    mutate(Date = as.Date(paste(Year, Month, "01", sep = "-")))
+
+ggplot(ev2, aes(x = Date, y = n, fill = predicted)) +
+    geom_bar(stat = "identity") +
+    scale_x_date(date_labels = "%Y-%m", date_breaks = "6 month") +
+    labs(x = "", y = "Count", fill = "Predicted") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+#| label: fig-predyear
+#| fig-cap: "Number of events and their predicted species grouped by year. Note different scales across the years."
+
+ggplot(ev2, aes(x = Month, y = n, fill = predicted)) +
+    geom_bar(stat = "identity") +
+    # scale_x_date(date_labels = "%Y-%m", date_breaks = "6 month") +
+    labs(x = "Month", y = "Count", fill = "Predicted") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    facet_wrap(~Year, scales = "free")
+```
+
+
+```{r}
+#| label: fig-predmonth
+#| fig-cap: "Number of events and their predicted species grouped by month of detections (all years combined)."
+
+# Add a variable with month names instead of the number
+ev2 <- ev2 %>%
+    mutate(MonthAbb = factor(Month, levels = 1:12, 
+                          labels = month.abb))
+
+ggplot(ev2, aes(x = MonthAbb, y = n, fill = predicted)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Month", y = "Count", fill = "Predicted") +
+    theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank()) +
+    scale_y_continuous(expand = expansion(add = c(0, 60)),
+                       breaks = seq(0, 900, by = 200),
+                       minor_breaks = seq(0, 900, by = 100))
+```
+
+
+
+\FloatBarrier
+```{r}
+# Create a bib database for R packages
+knitr::write_bib(c(.packages()
+                   ,'base'
+                   ,'banter', 'ranger', 'rpart', 'Boruta', 'tidymodels', 'ROSE', 'brulee'
+), 'refpackages.bib')
+```
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
+
+\FloatBarrier
+\newpage
+\beginsupplement
+# Appendix
+
+## Whistle characteristics by species
+
+```{r}
+D_wsl_long <- D_wsl %>%
+    pivot_longer(cols = any_of(predictors_wsl), 
+                 names_to = "Variable", 
+                 values_to = "Value")
+```
+
+Summaries of important whistle characteristics by species:
+```{r}
+des_species <- psych::describeBy(D_wsl %>% select(all_of(vars4table)),
+                                 D_wsl$species,
+                                 fast = TRUE)
+des_species
+```
+
+
+```{r}
+#| label: fig-wslspecies
+#| fig-cap: "Boxplots of predictors for whistle classification, by species."
+#| fig-width: 10
+#| fig-height: 14
+
+D_wsl_long %>%
+  ggplot(aes(x = species, y = Value)) +
+  geom_boxplot() +
+  facet_wrap(vars(Variable), ncol = 5, scales = "free_y")
+```
+
+
+\FloatBarrier
+## Whistle characteristics by data source
+
+Summaries of important whistle characteristics by source of the data:
+```{r}
+des_source <- psych::describeBy(D_wsl %>% select(all_of(vars4table)),
+                                D_wsl$Source,
+                                fast = TRUE)
+des_source
+```
+
+
+```{r}
+#| label: fig-wslssource
+#| fig-cap: "Boxplots of predictors for whistle classification, by source."
+#| fig-width: 10
+#| fig-height: 14
+
+D_wsl_long %>%
+  ggplot(aes(x = Source, y = Value)) +
+  geom_boxplot() +
+  facet_wrap(vars(Variable), ncol = 5, scales = "free_y") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+```
+
+
+\FloatBarrier
+## Whistle characteristics for the manuscript summary table
+
+```{r}
+# 1. Calculate statistics for each individual source
+#    - Groups the data by 'Source'
+#    - Uses `across` to apply mean and standard deviation calculations to all
+#      variables specified in `vars4table`.
+#    - Reshapes the data to a long format suitable for combining.
+individual_source_stats <- D_wsl %>%
+  group_by(Source) %>%
+  summarise(across(all_of(vars4table),
+                   .fns = list(
+                     mean = ~mean(., na.rm = TRUE),
+                     sd = ~sd(., na.rm = TRUE)
+                   ),
+                   .names = "{.col}_{.fn}" # Creates columns like 'freq_min_mean', 'freq_min_sd'
+  ), .groups = 'drop') %>%
+  # Convert to long format for easier formatting and combination
+  pivot_longer(
+    cols = -Source, # Select all columns except 'Source'
+    names_to = c("characteristic", ".value"), # Split names like 'freq_min_mean' into 'freq_min' and 'mean'
+    names_sep = "_", # Separator used for splitting names
+    values_to = "value" # 'value' is a placeholder, as .value will create 'mean' and 'sd' columns
+  ) %>%
+  # Format the mean and standard deviation into a single string "mean (sd)"
+  mutate(
+    formatted_stats = paste0(
+      sprintf("%.2f", mean), " (", sprintf("%.2f", sd), ")" # Format to 2 decimal places
+    )
+  ) %>%
+  select(Source, characteristic, formatted_stats) # Keep only necessary columns
+
+
+# 2. Calculate statistics for the aggregated group ("UFRJ", "AMAPPS", "Watkins")
+aggregated_stats <- D_wsl %>%
+  filter(Source %in% c("UFRJ", "AMAPPS", "Watkins")) %>% # Filter for the specific sources to aggregate
+  summarise(across(all_of(vars4table),
+                   .fns = list(
+                     mean = ~mean(., na.rm = TRUE),
+                     sd = ~sd(., na.rm = TRUE)
+                   ),
+                   .names = "{.col}_{.fn}"
+  ), .groups = 'drop') %>%
+  pivot_longer(
+    cols = everything(), # Select all columns after summarise
+    names_to = c("characteristic", ".value"),
+    names_sep = "_",
+    values_to = "value"
+  ) %>%
+  mutate(
+    Source = "Aggregated (UFRJ, AMAPPS, Watkins)", # Assign the new source name
+    formatted_stats = paste0(
+      sprintf("%.2f", mean), " (", sprintf("%.2f", sd), ")"
+    )
+  ) %>%
+  select(Source, characteristic, formatted_stats)
+
+
+# 3. Combine the individual source statistics and the aggregated statistics
+combined_stats <- bind_rows(individual_source_stats, aggregated_stats)
+
+
+# 4. Pivot the combined data to a wide format to create the desired table structure
+#    - 'characteristic' will be the row identifier.
+#    - 'Source' values will become the column headers.
+#    - 'formatted_stats' will populate the table cells.
+summary_table <- combined_stats %>%
+  pivot_wider(
+    names_from = Source, # Column headers will be the source names
+    values_from = formatted_stats # Cell values will be the formatted statistics
+  )
+
+
+# 5. Arrange the characteristics (rows) in the original order specified in vars4table
+summary_table$characteristic <- factor(summary_table$characteristic, levels = vars4table)
+summary_table <- summary_table %>% arrange(characteristic)
+
+
+# 6. Define and reorder the columns for the final display
+col_order_final <- c("AMAPPS", "Watkins", "UFRJ", "Aggregated (UFRJ, AMAPPS, Watkins)", "T1C") 
+
+# Filter this order to only include columns that actually exist in the summary_table,
+# in case some sources had no data or the aggregated column was not created.
+final_col_selection <- intersect(col_order_final, names(summary_table))
+
+# Apply the final column order
+summary_table <- summary_table %>% select(all_of(final_col_selection))
+
+# 7. Print the summary table using kable for a clean output
+kable(summary_table, caption = "Summary of Whistle Characteristics by Source")
+write.csv(summary_table, "dataderived/whistle_characteristics_summary.csv", 
+          row.names = FALSE)
+```
+
+
+\FloatBarrier
+## Partial dependence plots from the selected model
+
+```{r}
+if (rerun_pdp) {
+  require(randomForest)
+  
+  # Extract variable importance and rank variables from the most to least important
+  vimp <- importance(rf1)[, "MeanDecreaseAccuracy"] %>% 
+    sort(decreasing = TRUE)
+  vnames <- names(vimp)
+  
+  # For all variables, calculate partial effects, save as a list
+  plist <- lapply(vnames, function(v) pdp::partial(rf1, 
+                                                   pred.var = v,
+                                                   train = df1, 
+                                                   plot = FALSE))
+  
+  # Save the output for plotting
+  saveRDS(plist, "dataderived/banter_plist.rds")
+} else {
+  plist <- readRDS("dataderived/banter_plist.rds")
+}
+```
+
+
+```{r}
+#| label: fig-pdps
+#| fig-cap: "Partial dependence plots from the detector-level classification model, from the most to the least important predictor."
+#| fig-width: 10
+#| fig-height: 14
+
+plotlist <- lapply(plist, function(p) ggplot2::autoplot(p))
+patchwork::wrap_plots(plotlist, ncol = 5)
+```
+
+
+
+

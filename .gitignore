@@ -1,0 +1,17 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+
+# ignore specific formats
+*.xls*
+*.zip
+
+# ignore outputs
+*_cache/
+image*/
+*.doc*
+*.html
+*.pdf
+*.pptx
