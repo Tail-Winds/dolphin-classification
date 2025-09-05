@@ -9,3 +9,5 @@ The main files are:
 Set `echo: true` in YAML header and recompile to see the underlying code along the outputs in the resulting file `report_species.pdf`. 
 In the section "General parameters", set `rerun_CV <- TRUE` to rerun the cross-validation and generate new results (the cross-validation codes are in the folder `code/`); it is set to `FALSE` by default to use the precomputed results.
 Similarly, set `rerun_pdp <- TRUE` to update partial dependence plots, which are set to `FALSE` by default.
+- `code/map_dolphins.R`: Loads the metadata file from `dataraw/` and generates a map of the recording locations:
+![](map_dolphins.png)
